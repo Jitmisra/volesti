@@ -758,6 +758,12 @@ public:
         compute_reflection(v, dot_prod, facet);
     }
 
+    // overload for int facet (needed by GaussianHMCExactWalk which passes int)
+    void compute_reflection(Point& v, Point const& p, int facet) const
+    {
+        compute_reflection(v, p, static_cast<unsigned int>(facet));
+    }
+
 
     template <typename update_parameters>
     void compute_reflection(Point &v, Point const&, update_parameters const& params) const
@@ -765,6 +771,133 @@ public:
         NT dot_prod = params.inner_vi_ak;
         unsigned int facet = params.facet_prev;
         compute_reflection(v, dot_prod, facet);
+    }
+
+
+    /// Boundary oracle for exact HMC spherical Gaussian sampling on order polytopes.
+    /// Computes the minimum positive time t at which the sinusoidal trajectory
+    ///   x(t) = cos(omega*t) * r + sin(omega*t)/omega * v
+    /// first exits the polytope (hits a facet).
+    ///
+    /// KEY OPTIMIZATION: Instead of computing A*r and A*v via dense matrix-vector
+    /// products (O(m*n) as in HPolytope), we exploit the sparse structure of
+    /// order polytope constraints to compute each a_i^T r and a_i^T v in O(1),
+    /// giving O(n + |E|) total cost per boundary query.
+    ///
+    /// @param r     Current position point
+    /// @param v     Current velocity/momentum vector
+    /// @param omega Angular frequency = sqrt(2 * a_i) where a_i is the Gaussian precision
+    /// @param facet_prev Index of the previously hit facet (-1 if none), used to
+    ///                   avoid re-detecting the same boundary hit due to numerical error
+    /// @return pair(t_min, facet_index) — minimum positive hit time and the facet hit
+    std::pair<NT, int> trigonometric_positive_intersect(Point const& r, Point const& v,
+                                                        NT const& omega, int &facet_prev) const
+    {
+        constexpr NT pi_2 = NT(2.0) * M_PI;
+        NT t = std::numeric_limits<NT>::max();
+        int facet = -1;
+
+        const NT omega_sqr = omega * omega;
+        const NT pi_2_omega = pi_2 / omega;
+
+        unsigned int num_relations = _poset.num_relations();
+
+        // Helper lambda: solve C*cos(omega*t + Phi) = b_val for the
+        // minimum positive t, where C and Phi are derived from Ar and Av.
+        // This is the per-hyperplane root-finding kernel — O(1) per call.
+        //
+        // NORMALIZATION LOGIC:
+        //   When _normalized == true, the stored b vector has ALREADY been
+        //   divided by _row_norms during normalize(). So we use b(idx) directly.
+        //   But Ar_i and Av_i are computed from RAW coordinates (not from the
+        //   normalized A matrix), so we DO need to divide them by _row_norms
+        //   to match the normalized constraint row.
+        auto solve_trig = [&](NT Ar_i, NT Av_i, int idx) {
+            NT b_val = b(idx);  // Already normalized if _normalized==true
+
+            // If polytope is normalized, scale Ar and Av to match normalized A
+            if (_normalized) {
+                NT rn = _row_norms(idx);
+                Ar_i /= rn;
+                Av_i /= rn;
+            }
+
+            // Amplitude C = sqrt(Ar^2 + (Av/omega)^2)
+            NT C = std::sqrt(Ar_i * Ar_i + (Av_i * Av_i) / omega_sqr);
+
+            // Phase Phi = atan(-Av / (Ar * omega))
+            NT Phi = std::atan((-Av_i) / (Ar_i * omega));
+
+            // Correct quadrant based on sign of Av
+            if (Av_i < NT(0) && Phi < NT(0)) {
+                Phi += M_PI;
+            } else if (Av_i > NT(0) && Phi > NT(0)) {
+                Phi -= M_PI;
+            }
+
+            // Only solve if trajectory can reach the boundary (C > b)
+            if (C > b_val) {
+                NT acos_b = std::acos(b_val / C);
+
+                NT t1 = (acos_b - Phi) / omega;
+                if (facet_prev == idx && std::abs(t1) < NT(1e-10)) {
+                    t1 = pi_2_omega;
+                }
+
+                NT t2 = (-acos_b - Phi) / omega;
+                if (facet_prev == idx && std::abs(t2) < NT(1e-10)) {
+                    t2 = pi_2_omega;
+                }
+
+                // Ensure positive times
+                t1 += (t1 < NT(0)) ? pi_2_omega : NT(0);
+                t2 += (t2 < NT(0)) ? pi_2_omega : NT(0);
+
+                NT tmin = std::min(t1, t2);
+
+                if (tmin < t && tmin > NT(0)) {
+                    facet = idx;
+                    t = tmin;
+                }
+            }
+        };
+
+        // ============================================================
+        // (A) Lower bound constraints: -x_i <= 0  (rows 0 .. d-1)
+        //     a_i = -e_i, so a_i^T r = -r[i], a_i^T v = -v[i]
+        //     Cost: O(1) per constraint, O(d) total
+        // ============================================================
+        for (unsigned int i = 0; i < _d; ++i) {
+            NT Ar_i = -r[i];       // O(1): single coordinate read
+            NT Av_i = -v[i];       // O(1): single coordinate read
+            solve_trig(Ar_i, Av_i, i);
+        }
+
+        // ============================================================
+        // (B) Upper bound constraints: x_i <= 1   (rows d .. 2d-1)
+        //     a_i = e_i, so a_i^T r = r[i], a_i^T v = v[i]
+        //     Cost: O(1) per constraint, O(d) total
+        // ============================================================
+        for (unsigned int i = 0; i < _d; ++i) {
+            NT Ar_i = r[i];        // O(1)
+            NT Av_i = v[i];        // O(1)
+            solve_trig(Ar_i, Av_i, i + _d);
+        }
+
+        // ============================================================
+        // (C) Ordering constraints: x_a - x_b <= 0  (rows 2d .. 2d+|E|-1)
+        //     a_i = e_a - e_b, so a_i^T r = r[a]-r[b], a_i^T v = v[a]-v[b]
+        //     Cost: O(1) per constraint, O(|E|) total
+        // ============================================================
+        for (unsigned int idx = 0; idx < num_relations; ++idx) {
+            std::pair<unsigned int, unsigned int> rel = _poset.get_relation(idx);
+            NT Ar_i = r[rel.first] - r[rel.second];    // O(1): two coordinate reads
+            NT Av_i = v[rel.first] - v[rel.second];    // O(1): two coordinate reads
+            solve_trig(Ar_i, Av_i, 2*_d + idx);
+        }
+
+        facet_prev = facet;
+        return std::make_pair(t, facet);
     }
 };
 
