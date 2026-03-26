@@ -774,6 +774,47 @@ public:
     }
 
 
+    /// Sparse nudge-in for order polytopes — O(n + |E|) complexity.
+    /// After a boundary reflection, numerical drift may push the point
+    /// slightly outside the polytope. This method corrects it by checking
+    /// each constraint's slack directly via coordinate reads, avoiding
+    /// the dense get_mat() / get_dense_mat() path entirely.
+    ///
+    /// @param p     Point to nudge back inside (modified in-place)
+    /// @param tol   Tolerance for constraint violation (default 1e-7)
+    void sparse_nudge_in(Point& p, NT tol = NT(1e-7)) const
+    {
+        unsigned int num_relations = _poset.num_relations();
+
+        // (A) Lower bounds: x_i >= 0
+        for (unsigned int i = 0; i < _d; ++i) {
+            if (p[i] < tol) {
+                p.set_coord(i, tol);
+            }
+        }
+
+        // (B) Upper bounds: x_i <= 1
+        for (unsigned int i = 0; i < _d; ++i) {
+            if (p[i] > NT(1) - tol) {
+                p.set_coord(i, NT(1) - tol);
+            }
+        }
+
+        // (C) Ordering constraints: x_a <= x_b
+        //     If violated (x_a > x_b - tol), push both toward their midpoint
+        for (unsigned int idx = 0; idx < num_relations; ++idx) {
+            std::pair<unsigned int, unsigned int> rel = _poset.get_relation(idx);
+            unsigned int a = rel.first;
+            unsigned int b = rel.second;
+            if (p[a] > p[b] - tol) {
+                NT mid = (p[a] + p[b]) / NT(2);
+                p.set_coord(a, mid - tol / NT(2));
+                p.set_coord(b, mid + tol / NT(2));
+            }
+        }
+    }
+
+
     /// Boundary oracle for exact HMC spherical Gaussian sampling on order polytopes.
     /// Computes the minimum positive time t at which the sinusoidal trajectory
     ///   x(t) = cos(omega*t) * r + sin(omega*t)/omega * v

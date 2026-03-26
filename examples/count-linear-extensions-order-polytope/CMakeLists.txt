@@ -67,3 +67,6 @@ target_link_libraries(count_le PUBLIC lp_solve)
 
 add_executable(test_trig_oracle test_trigonometric_oracle.cpp)
 target_link_libraries(test_trig_oracle PUBLIC lp_solve)
+
+add_executable(benchmark_oracle benchmark_oracle.cpp)
+target_link_libraries(benchmark_oracle PUBLIC lp_solve)
